@@ -29,7 +29,8 @@ export function run(input) {
   // ---- 3-4. Front matter + refusal checks (exact order) ------------------
   const built = [];
   for (const f of sources) {
-    const content = f.content.replace(/\r\n?/g, '\n');
+    const raw = f.content;
+    const content = raw.indexOf('\r') === -1 ? raw : raw.replace(/\r\n?/g, '\n');
     const fm = parseFrontMatter(content);
     if (fm.error) { report.push(`refused ${f.path}: ${fm.error}`); continue; }
     const slash = f.path.indexOf('/');
@@ -148,7 +149,7 @@ export function run(input) {
   for (const b of built) {
     const layout = b.data.layout || (b.isPost ? 'post' : 'page');
     const t = templates.get(layout);
-    const scopes = [Object.assign({}, rootVars, { page: b.page })];
+    const scopes = [rootVars, { page: b.page }];
     const buf = [];
     renderNodes(t.nodes, scopes, buf, templates, 0);
     out[b.outPath] = buf.join('');
@@ -167,7 +168,7 @@ export function run(input) {
         newer_url: k === 1 ? '' : (k === 2 ? base + '/' : base + '/page/' + (k - 1) + '/'),
         older_url: k === totalPages ? '' : base + '/page/' + (k + 1) + '/',
       };
-      const scopes = [Object.assign({}, rootVars, { posts: slice.map((p) => p.card), pager })];
+      const scopes = [rootVars, { posts: slice.map((p) => p.card), pager }];
       const buf = [];
       renderNodes(indexTmpl.nodes, scopes, buf, templates, 0);
       out[k === 1 ? 'index.html' : 'page/' + k + '/index.html'] = buf.join('');
@@ -181,7 +182,7 @@ export function run(input) {
         name: g.name, slug: g.slug, url: g.url, count: g.posts.length,
         posts: g.posts.map((p) => p.card),
       };
-      const scopes = [Object.assign({}, rootVars, { tag: tagVar })];
+      const scopes = [rootVars, { tag: tagVar }];
       const buf = [];
       renderNodes(tagTmpl.nodes, scopes, buf, templates, 0);
       out['tags/' + g.slug + '/index.html'] = buf.join('');
@@ -190,7 +191,7 @@ export function run(input) {
   // Tag list page.
   const tagsTmpl = templates.get('tags');
   if (tagsTmpl && tagsTmpl.ok) {
-    const scopes = [Object.assign({}, rootVars)];
+    const scopes = [rootVars];
     const buf = [];
     renderNodes(tagsTmpl.nodes, scopes, buf, templates, 0);
     out['tags/index.html'] = buf.join('');
@@ -236,26 +237,17 @@ function uniqueSuffixed(set, slug) {
 // ---------------------------------------------------------------------------
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
+const ESC_FIRST_RE = /[&<>"']/g;
+const ESC_ALL_RE = /[&<>"']/g;
+
 function escapeHtml(s, a, b) {
   if (a === undefined) { a = 0; b = s.length; }
-  // Fast path (the common case): no escapable char in the range at all.
-  // Five indexOf scans run in C++ and cost far less than a per-char loop.
-  let has = false;
-  for (const c of ['&', '<', '>', '"', "'"]) {
-    const i = s.indexOf(c, a);
-    if (i !== -1 && i < b) { has = true; break; }
-  }
-  if (!has) return s.slice(a, b);
-  let out = '';
-  let start = a;
-  for (let i = a; i < b; i++) {
-    const e = ESC_MAP[s[i]];
-    if (e !== undefined) {
-      out += s.slice(start, i) + e;
-      start = i + 1;
-    }
-  }
-  return out + s.slice(start, b);
+  // One native scan for the first escapable char (lastIndex always reset
+  // before exec, so the shared regex is safe under recursion elsewhere).
+  ESC_FIRST_RE.lastIndex = a;
+  const m = ESC_FIRST_RE.exec(s);
+  if (!m || m.index >= b) return (a === 0 && b === s.length) ? s : s.slice(a, b);
+  return s.slice(a, m.index) + s.slice(m.index, b).replace(ESC_ALL_RE, (ch) => ESC_MAP[ch]);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,16 +293,15 @@ function slugifySlow(text) {
 // ---------------------------------------------------------------------------
 // Word count without allocation (SPEC G3): JS \s definition.
 // ---------------------------------------------------------------------------
+const WS_TABLE = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF]) WS_TABLE[c] = 1;
+for (let c = 0x2000; c <= 0x200A; c++) WS_TABLE[c] = 1;
+
 function countWords(s) {
   let n = 0;
   let inW = false;
   for (let i = 0; i < s.length; i++) {
-    const code = s.charCodeAt(i);
-    // JS \s, inlined (no per-char function call).
-    const ws = code === 9 || code === 10 || code === 11 || code === 12 || code === 13 || code === 32 ||
-      code === 0xA0 || code === 0x1680 || (code >= 0x2000 && code <= 0x200A) || code === 0x2028 ||
-      code === 0x2029 || code === 0x202F || code === 0x205F || code === 0x3000 || code === 0xFEFF;
-    if (ws) inW = false;
+    if (WS_TABLE[s.charCodeAt(i)]) inW = false;
     else if (!inW) { n++; inW = true; }
   }
   return n;
@@ -554,7 +545,12 @@ const HR_RE = /^(---|\*\*\*)[ \t]*$/;
 const ORDERED_RE = /^(\d{1,9})\. /;
 const BLANK_RE = /^[ \t]*$/;
 
-function isBlank(line) { return BLANK_RE.test(line); }
+function isBlank(line) {
+  if (line.length === 0) return true;
+  const c = line[0];
+  if (c !== ' ' && c !== '\t') return false;
+  return BLANK_RE.test(line);
+}
 
 function renderMarkdown(body, slugify, resolve) {
   const lines = body.split('\n');
@@ -569,12 +565,12 @@ function renderMarkdown(body, slugify, resolve) {
     const line = lines[i];
     if (isBlank(line)) { i++; continue; }
     // 1. Fence.
-    let m = FENCE_OPEN_RE.exec(line);
+    let m = line[0] === '`' ? FENCE_OPEN_RE.exec(line) : null;
     if (m) {
       const lang = m[1];
       const buf = [];
       i++;
-      while (i < n && !FENCE_CLOSE_RE.test(lines[i])) { buf.push(lines[i]); i++; }
+      while (i < n && !(lines[i][0] === '`' && FENCE_CLOSE_RE.test(lines[i]))) { buf.push(lines[i]); i++; }
       if (i < n) i++;
       let html = '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>';
       for (const bl of buf) html += escapeHtml(bl) + '\n';
@@ -583,7 +579,7 @@ function renderMarkdown(body, slugify, resolve) {
       continue;
     }
     // 2. Heading.
-    m = HEADING_RE.exec(line);
+    m = line[0] === '#' ? HEADING_RE.exec(line) : null;
     if (m) {
       const text = m[2].replace(/[ \t]+$/, '');
       if (text !== '') {
@@ -598,7 +594,7 @@ function renderMarkdown(body, slugify, resolve) {
       }
     }
     // 3. Thematic break.
-    if (HR_RE.test(line)) { out.push('<hr>\n'); i++; continue; }
+    if ((line[0] === '-' || line[0] === '*') && HR_RE.test(line)) { out.push('<hr>\n'); i++; continue; }
     // 4. Blockquote.
     if (line[0] === '>') {
       const parts = [];
@@ -623,7 +619,7 @@ function renderMarkdown(body, slugify, resolve) {
         const l = lines[i];
         const nm = listStart(l);
         if (nm && nm.type === type) { items.push([l.slice(nm.markerLen).trim()]); i++; continue; }
-        if (/^ {2,}\S/.test(l)) { items[items.length - 1].push(l.trim()); i++; continue; }
+        if (l.length >= 3 && l[0] === ' ' && l[1] === ' ' && /^ {2,}\S/.test(l)) { items[items.length - 1].push(l.trim()); i++; continue; }
         break;
       }
       let html;
@@ -644,10 +640,10 @@ function renderMarkdown(body, slugify, resolve) {
     while (i < n) {
       const l = lines[i];
       if (isBlank(l)) break;
-      if (FENCE_OPEN_RE.test(l)) break;
-      const hm = HEADING_RE.exec(l);
+      if (l[0] === '`' && FENCE_OPEN_RE.test(l)) break;
+      const hm = l[0] === '#' ? HEADING_RE.exec(l) : null;
       if (hm && hm[2].replace(/[ \t]+$/, '') !== '') break;
-      if (HR_RE.test(l)) break;
+      if ((l[0] === '-' || l[0] === '*') && HR_RE.test(l)) break;
       para.push(l.trim());
       i++;
     }
@@ -661,28 +657,36 @@ function renderMarkdown(body, slugify, resolve) {
 
 function listStart(line) {
   if (line.startsWith('- ') || line.startsWith('* ')) return { type: 'ul', markerLen: 2, num: 0 };
+  if (line.length === 0) return null;
+  const c0 = line.charCodeAt(0);
+  if (c0 < 48 || c0 > 57) return null;
   const m = ORDERED_RE.exec(line);
   if (m) return { type: 'ol', markerLen: m[0].length, num: parseInt(m[1], 10) };
   return null;
 }
 
+const INLINE_RE = /[\\`*[]/g;
+const INLINE_PLAIN_RE = /[\\`*\[&<>"']/;
+
 function inline(s, resolve) {
+  // Lazy fast path (bench #3): a span with no Markdown special and no
+  // HTML-escapable char renders exactly as itself — no array, no join.
+  if (!INLINE_PLAIN_RE.test(s)) return s;
   const out = [];
   const n = s.length;
   let i = 0;
   while (i < n) {
-    let next = n;
-    let k;
-    k = s.indexOf('\\', i); if (k !== -1 && k < next) next = k;
-    k = s.indexOf('`', i); if (k !== -1 && k < next) next = k;
-    k = s.indexOf('*', i); if (k !== -1 && k < next) next = k;
-    k = s.indexOf('[', i); if (k !== -1 && k < next) next = k;
+    // One native scan for the next special char; lastIndex is reset before
+    // every exec, so the shared regex stays correct across recursion.
+    INLINE_RE.lastIndex = i;
+    const mm = INLINE_RE.exec(s);
+    const next = mm ? mm.index : n;
     if (next > i) { out.push(escapeHtml(s, i, next)); i = next; }
     if (i >= n) break;
     const c = s[i];
     if (c === '\\') {
       const d = s[i + 1];
-      if (d !== undefined && ESCAPABLE.has(d)) { out.push(escapeHtml(d)); i += 2; }
+      if (d !== undefined && ESCAPABLE.has(d)) { out.push(ESC_MAP[d] || d); i += 2; }
       else { out.push('\\'); i += 1; }
     } else if (c === '`') {
       const j = s.indexOf('`', i + 1);
